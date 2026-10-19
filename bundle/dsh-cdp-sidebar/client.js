@@ -225,7 +225,7 @@
                 if (info && info.ok && info.data) {
                   this.onFrame(info.data, {});
                   this.pollErrors = 0;
-                  this.emit({ phase: 'polling', url: info.url || '', title: info.title || '', targetId: target });
+                  this.emit({ phase: 'polling', url: info.url || '', title: info.title || '', targetId: target, targets: this.targetList() });
                 } else {
                   this.pollErrors += 1;
                   this.emit({ detail: '轮询失败：' + ((info && (info.detail || info.hint)) || 'HTTP ' + res.status) });
@@ -530,6 +530,8 @@
             const { sessionId } = await this.command('Target.attachToTarget', { targetId, flatten: true });
             this.sessionId = sessionId;
             this.targetId = targetId;
+            const mark = this.manualTargetId === targetId ? { manualUntil: this.manualUntil } : {};
+            this.emit({ targetId, ...mark });
             await this.command('Page.enable', {}, sessionId);
             try {
               const metrics = await this.command('Page.getLayoutMetrics', {}, sessionId);
@@ -550,6 +552,32 @@
             if (this.screencast) await this.command('Page.startScreencast', { format: 'jpeg', quality: 70, everyNthFrame: 1 }, sessionId);
           }
           /* ───────── 自动跟随：镜像「MCP 正在操作的那个页面」 ───────── */
+          /* 手动切换：用户在 URL 下拉里点了别的标签页，就镜像那一页。
+             记下 manualTargetId，自动跟随不再把它抢回去 */
+          switchTo(targetId) {
+            if (!targetId || this.closed) return Promise.resolve(false);
+            if (targetId === this.targetId && this.sessionId) return Promise.resolve(true);
+            this.manualTargetId = targetId;
+            this.manualUntil = Date.now() + 10 * 60 * 1000;
+            return this.attach(targetId)
+              .then(() => {
+                /* 切过去之后补一次画面，别等用户去动页面才出帧 */
+                if (!this.pollTarget) this.setScreencast(true).catch(() => {});
+                this.emit({ targets: this.targetList() });
+                return true;
+              })
+              .catch((error) => {
+                this.emit({ detail: '切换标签页失败：' + String((error && error.message) || error) });
+                return false;
+              });
+          }
+          /* 手动选择还在有效期内，且那一页还活着 */
+          manualPicker() {
+            if (!this.manualTargetId) return null;
+            if (Date.now() > this.manualUntil) { this.manualTargetId = null; return null; }
+            if (!this.targets.has(this.manualTargetId)) { this.manualTargetId = null; return null; }
+            return this.targets.get(this.manualTargetId);
+          }
           seedTargets(list) {
             const stamp = (this.seedAt = Date.now());
             for (const row of list || []) {
@@ -598,6 +626,9 @@
             return moved || (isNew && method === 'Target.targetCreated');
           }
           pickActive() {
+            /* 用户在 URL 下拉里手动选过，就先听用户的，别被自动跟随抢回去 */
+            const manual = this.manualPicker();
+            if (manual) return manual;
             /* 有主代理的租约就跟着它，子代理的 tab 再活跃也不抢画面 */
             if (this.primaryTargetId) {
               const primary = this.targets.get(this.primaryTargetId);
@@ -674,6 +705,7 @@
             this.pollTarget = next.targetId;
             this.targetId = next.targetId;
             this.pollErrors = 0;
+            this.manualTargetId = null;
             this.emit({ phase: 'polling', targetId: next.targetId, detail: '原目标已消失，自动切到 ' + (next.url || next.targetId) });
             return true;
           }
@@ -796,6 +828,22 @@
           ripple: { position: 'absolute', width: 18, height: 18, marginLeft: -9, marginTop: -9, borderRadius: 99, border: '2px solid #38bdf8', pointerEvents: 'none', opacity: 0, transition: 'opacity .25s' },
           small: { fontSize: 11, color: token('--dsw-alias-text-tertiary', '#9ca3af') },
           url: { fontSize: 12, color: token('--dsw-alias-text-secondary', '#6b7280'), overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          /* URL 下拉切换器 */
+          picker: { display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', borderRadius: 8, border: '1px solid transparent', background: 'transparent', color: token('--dsw-alias-text-secondary', '#6b7280'), font: 'inherit', fontSize: 12, cursor: 'pointer', textAlign: 'left', minWidth: 0 },
+          pickerOpen: { border: '1px solid ' + token('--dsw-alias-border-primary', '#d1d5db'), background: token('--dsw-alias-surface-secondary', '#f3f4f6'), color: token('--dsw-alias-text-primary', '#111827') },
+          pickerText: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          caret: { flex: '0 0 auto', fontSize: 9, opacity: 0.7 },
+          manualBadge: { flex: '0 0 auto', padding: '0 5px', borderRadius: 5, background: token('--dsw-alias-action-primary-primary', '#247bbf'), color: '#fff', fontSize: 10, lineHeight: '16px' },
+          pickerPanel: { borderBottom: '1px solid ' + token('--dsw-alias-border-primary', '#e5e7eb'), background: token('--dsw-alias-surface-primary', '#fff'), flex: '0 0 auto', maxHeight: 220, display: 'flex', flexDirection: 'column', overflow: 'hidden' },
+          pickerHead: { padding: '6px 10px', fontSize: 11, color: token('--dsw-alias-text-tertiary', '#9ca3af'), borderBottom: '1px solid ' + token('--dsw-alias-border-primary', '#f1f5f9') },
+          pickerList: { overflowY: 'auto', flex: '1 1 auto', minHeight: 0 },
+          pickerItem: { display: 'flex', alignItems: 'flex-start', gap: 6, width: '100%', padding: '5px 10px', border: 'none', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 12, textAlign: 'left', cursor: 'pointer' },
+          pickerItemActive: { background: token('--dsw-alias-surface-secondary', '#eef4fb') },
+          pickerDot: { flex: '0 0 auto', width: 10, fontSize: 9, color: token('--dsw-alias-action-primary-primary', '#247bbf'), lineHeight: '18px' },
+          pickerItemBody: { display: 'flex', flexDirection: 'column', minWidth: 0, flex: '1 1 auto' },
+          pickerItemTitle: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: token('--dsw-alias-text-primary', '#111827') },
+          pickerItemUrl: { fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: token('--dsw-alias-text-tertiary', '#9ca3af') },
+          pickerReset: { borderTop: '1px solid ' + token('--dsw-alias-border-primary', '#f1f5f9'), color: token('--dsw-alias-action-primary-primary', '#247bbf'), flex: '0 0 auto' },
           diag: {
             padding: '6px 10px',
             borderBottom: '1px solid ' + token('--dsw-alias-border-primary', '#e5e7eb'),
@@ -832,9 +880,11 @@
           const [ui, setUi] = useState({
             phase: 'idle', url: '', title: '', targets: [], base: '', browser: '', detail: '',
             diag: '', via: '', bridgeUrl: '', pageOrigin: '', pageHost: '', targetId: '',
+            manualUntil: 0,
           });
           const [tick, setTick] = useState(0);
           const [showDebug, setShowDebug] = useState(false);
+          const [pickerOpen, setPickerOpen] = useState(false);
 
           const onState = useCallback((patch) => setUi((prev) => ({ ...prev, ...patch })), []);
 
@@ -1021,19 +1071,84 @@
           const autoDebug = ui.phase !== 'live' && ui.phase !== 'polling';
           const debugOpen = showDebug || autoDebug;
 
+          /* ── 标签页下拉：把顶部那行 URL 做成可以切换镜像目标的控件 ── */
+          const targets = Array.isArray(ui.targets) ? ui.targets : [];
+          const currentId = ui.targetId || '';
+          const isManual = !!(ui.manualUntil && Date.now() < ui.manualUntil);
+          const shortName = (row) => {
+            const raw = (row && (row.title || row.url)) || '';
+            if (!raw) return '（无标题）';
+            try {
+              const u = new URL(raw);
+              return (row.title && row.title.trim()) || u.host + (u.pathname === '/' ? '' : u.pathname);
+            } catch { return raw; }
+          };
+          const choose = (targetId) => {
+            setPickerOpen(false);
+            const mirror = mirrorRef.current;
+            if (mirror && typeof mirror.switchTo === 'function') mirror.switchTo(targetId);
+          };
+
           return h('div', { className: 'dsh-cdp-shell', style: S.shell, 'data-dsh-cdp-phase': ui.phase }, [
             h('div', { style: S.bar, key: 'bar' }, [
               h('span', { style: S.status, title: ui.detail || '' }, [
                 h('span', { style: { ...S.dot, background: PHASE_COLOR[ui.phase] || PHASE_COLOR.idle } }),
                 h('span', null, phaseLabel),
               ]),
-              h('span', { style: { ...S.url, ...S.grow, minWidth: 0 }, title: ui.title || ui.url || '' }, ui.url || t('empty')),
+              /* 当前 URL：点一下展开标签页列表，选哪页就镜像哪页 */
+              h('button', {
+                type: 'button',
+                key: 'picker',
+                'data-dsh-cdp-picker': '1',
+                style: { ...S.picker, ...(pickerOpen ? S.pickerOpen : null), flex: '1 1 220px', minWidth: 0 },
+                title: (ui.title ? ui.title + '\n' : '') + (ui.url || '') + (targets.length ? '\n共 ' + targets.length + ' 个标签页，点击切换' : ''),
+                onClick: () => setPickerOpen((v) => !v),
+              }, [
+                h('span', { style: S.pickerText }, ui.url || t('empty')),
+                isManual ? h('span', { style: S.manualBadge, title: '已手动选择，自动跟随暂停 10 分钟' }, '手动') : null,
+                h('span', { style: S.caret, 'aria-hidden': true }, pickerOpen ? '▲' : '▼'),
+              ]),
               h('button', {
                 style: { ...S.button, opacity: debugOpen ? 1 : 0.55 },
                 onClick: () => setShowDebug((v) => !v),
                 title: '诊断信息（出问题时自动展开）',
               }, '⚙'),
             ]),
+            pickerOpen ? h('div', { style: S.pickerPanel, key: 'picker-panel', 'data-dsh-cdp-picker-panel': '1' }, [
+              h('div', { style: S.pickerHead }, 'Chrome 标签页 · ' + targets.length + ' 个' + (isManual ? '（手动模式）' : '')),
+              targets.length
+                ? h('div', { style: S.pickerList }, targets.map((row) => {
+                  const active = row.targetId === currentId;
+                  return h('button', {
+                    type: 'button',
+                    key: row.targetId,
+                    style: { ...S.pickerItem, ...(active ? S.pickerItemActive : null) },
+                    title: (row.title ? row.title + '\n' : '') + (row.url || ''),
+                    onClick: () => choose(row.targetId),
+                  }, [
+                    h('span', { style: S.pickerDot, 'aria-hidden': true }, active ? '●' : ''),
+                    h('span', { style: S.pickerItemBody }, [
+                      h('span', { style: S.pickerItemTitle }, shortName(row)),
+                      h('span', { style: S.pickerItemUrl }, row.url || ''),
+                    ]),
+                  ]);
+                }))
+                : h('div', { style: { ...S.small, padding: '6px 10px' } }, '没有可切换的标签页'),
+              isManual ? h('button', {
+                type: 'button',
+                style: { ...S.pickerItem, ...S.pickerReset },
+                onClick: () => {
+                  setPickerOpen(false);
+                  const mirror = mirrorRef.current;
+                  if (mirror) {
+                    mirror.manualTargetId = null;
+                    mirror.manualUntil = 0;
+                    setUi((prev) => ({ ...prev, manualUntil: 0 }));
+                    mirror.scheduleFollow();
+                  }
+                },
+              }, '↻ 恢复自动跟随') : null,
+            ]) : null,
             debugOpen ? h('div', {
               style: S.diag,
               key: 'diag',
