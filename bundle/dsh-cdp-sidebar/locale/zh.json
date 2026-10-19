@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome 侧栏（CDP 镜像）",
+    "description": "把 127.0.0.1:9222 上的 Chrome 页面镜像进 DSH 右侧栏，并把鼠标与键盘经 CDP 回传。"
+  }
+}

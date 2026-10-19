@@ -1,0 +1,6 @@
+# Bundle patch layer：一行 Host 插件（index.js 挂 /dsh-cdp 探测路由），
+# package.json 的 dsh.client 让 Web 壳再加载 client.js 作为浏览器半边
+# （右侧栏 browser tab 的 extension 实现，接管内置 browser 类型的正文）。
+- insert:
+    - id: dsh-cdp-sidebar
+      name: dsh-cdp-sidebar

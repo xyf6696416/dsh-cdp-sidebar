@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome sidebar (CDP mirror)",
+    "description": "Mirrors the Chrome page on 127.0.0.1:9222 into the DSH right sidebar and sends mouse and keyboard input back over CDP."
+  }
+}
