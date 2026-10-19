@@ -37,18 +37,13 @@
     "name": "Chrome Sidebar (CDP mirror)",
     "version": "0.1.0",
     "permissions": "same-origin HTTP routes under /dsh-cdp; read-only probe of http://127.0.0.1:9222; client-side right sidebar tab",
-    "peerDependencies": {
-      "@deepseek-ai/dsh-client-ui-sidebar-browser": "*"
-    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-sidebar-browser"
-      ]
+      "inject": []
     }
   },
   "license": "MIT"

@@ -42,6 +42,7 @@ New-Item -ItemType Junction `
 
 **运行**：让 Chrome 带 `--remote-debugging-port=9222` 和独立 `--user-data-dir` 起来 →
 重启 DSH → 右侧栏新建 tab 选「Chrome（CDP）」。侧栏自己镜像当前页，不用按任何按钮。
+它是一个独立 tab 类型，**不会顶替浏览器**：会话里点链接仍然打开沙箱浏览器。
 
 **校验**，四条全绿即装好：
 
@@ -62,10 +63,20 @@ New-Item -ItemType Junction `
 | 文件 | 半侧 | 作用 |
 | --- | --- | --- |
 | `index.js` | Host（Node） | `GET /dsh-cdp/status` 探测 CDP；`upgrade /dsh-cdp/ws` 同源 WebSocket 桥；`GET /dsh-cdp/shot` + `POST /dsh-cdp/exec` HTTP 兜底；`POST /dsh-cdp/report` 客户端上报；`GET /dsh-cdp/diag` 诊断；`TabKeeper` 标签页归属与回收（`/tabs`、`/tab/claim`、`/tab/touch`、`/tab/release`、`/tab/reap`，见 §4.1） |
-| `client.js` | Web（浏览器） | 注册 `browser` 类型的 extension 实现 + 正文/标题座位 + 状态行 + canvas + 自动跟随 |
+| `client.js` | Web（浏览器） | 注册自己的 `cdp` tab 类型 + 正文/标题座位 + 状态行 + canvas + 自动跟随 |
 | `cordis.patch.yml` | Host | 一行 insert，让 `index.js` 进入组合 |
-| `package.json` | — | `dsh.bundle.patch` + `dsh.client {platform:'web', immediately:true, inject:[…]}` |
+| `package.json` | — | `dsh.bundle.patch` + `dsh.client {platform:'web', immediately:true, inject:[]}`（依赖由 `client.js` 的 `inject` 声明服务名） |
 | `locale/{zh,en}.json` | — | 插件卡片文案 |
+
+### tab 类型为什么是 `cdp` 而不是 `browser`
+
+`sidebarRightTabs` 的 band 规则是：`extension` 可以注册一个 `builtin` 已持有的 kind，并**接管**它
+（`coexists()` 允许两者共存，`RANKS = { extension: 3, builtin: 2, fallback: 1 }` 让 extension 胜出）。
+
+官方 `@deepseek-ai/dsh-client-ui-sidebar-browser` 用的是 `kind: 'browser'` / `priority: 'builtin'`。
+如果本插件也注册 `kind: 'browser'` 并给 `priority: 'extension'`，整个 `browser` kind 会被接管，
+**会话里点链接打开的就不再是沙箱浏览器，而是镜像 tab**。所以这里用自己的 `kind: 'cdp'`，
+`priority: 'builtin'`（独占自己不冲突的 kind），官方浏览器行为原样保留。
 
 ### 两条画面通道
 

@@ -14,7 +14,7 @@
         const zh = {
           'type.label': 'Chrome（CDP）',
           'guide.title': 'Chrome 镜像',
-          'guide.description': '自动镜像 MCP 正在操作的那个 Chrome 页面，无需任何按钮',
+          'guide.description': '把 9222 上的 Chrome 画面镜像进来；它不接管浏览器 tab，会话链接仍走浏览器',
           'phase.discovering': '正在发现 Chrome 调试端点…',
           'phase.live': '已镜像',
           'phase.offline': '连不上调试端点',
@@ -31,7 +31,7 @@
         const en = {
           'type.label': 'Chrome (CDP)',
           'guide.title': 'Chrome mirror',
-          'guide.description': 'Automatically mirrors whichever Chrome page MCP is operating on — no buttons',
+          'guide.description': 'Mirrors the Chrome on 9222; it does not take over browser tabs, session links still open in the browser',
           'phase.discovering': 'Discovering the Chrome debug endpoint…',
           'phase.live': 'Mirrored',
           'phase.offline': 'Debug endpoint unreachable',
@@ -1079,14 +1079,21 @@
 
         /* ───────── 注册 ───────── */
 
+        /* 自己独占一个 kind。
+           sidebarRightTabs 的 band 规则：extension 可以注册 builtin 已持有的 kind 并「接管」它。
+           官方 @deepseek-ai/dsh-client-ui-sidebar-browser 用的是 kind:'browser' / priority:'builtin'，
+           如果这里也注册 kind:'browser'，本插件会接管整个 browser kind，会话里的链接就都被
+           解析到镜像 tab 上，原来的沙箱浏览器被挤掉。所以用一个不冲突的 kind。 */
+        const KIND = 'cdp';
+
         function apply(ctx) {
           const t = ctx.locale.bind(NS);
           ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-cdp-sidebar.copy');
           ctx.effect(() => ctx.sidebarRightTabs.register({
             id: PLUGIN_ID,
-            kind: 'browser',
+            kind: KIND,
             multiple: true,
-            priority: 'extension',
+            priority: 'builtin',
             keepMounted: true,
             title: () => t('type.label'),
             guide: [{
