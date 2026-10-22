@@ -376,17 +376,46 @@ async function captureShot(sessions, targetId, quality) {
 /* ---------------- 标签页归属与回收（用完即弃） ----------------
    判据来自实测：
      · 插件装载时 /json/list 里已存在的 page 目标 = 用户自己窗口里的 → 永不自动关
-     · 装载之后新出现的 page 目标 = 自动化开的 → 才是回收候选
+     · 「装载之后新出现的」只有能被证明是自动化创建的才算回收候选（见 #20261020 事故记录）
      · chrome:// 一类永不关；侧栏正在镜像的那个永不关
    关一个 tab 只用 Chrome 的 HTTP 端点 GET /json/close/{targetId}，不需要 WebSocket。
-   claim（认领）= 「有人正在用这个 tab」：租约没到期不关，用完 release 立刻关。 */
+   claim（认领）= 「有人正在用这个 tab」：租约没到期不关，用完 release 默认只注销租约。
+
+   #20261020 事故：桌面快捷方式把用户日常 Chrome 也起在 9222 + 同一个 profile 上。
+   seed() 只在装载那一刻拍快照，一次都没成功时 protected 为空、seeded=false；
+   Chrome 重启后 targetId 全变，手动打开的页面全被当成 orphan 关掉，窗口被清空后浏览器自杀。
+   修法（全部是「宁可少关，不可错杀」）：
+     1. re-seed：seed 没成功，或 Chrome 重启（user-data-dir 的 targetId 全变）→ 现有页面重新收进 protected
+     2. 新页面只进「观察名单」，攒够 confirmMs 观测时间才升级成可回收候选
+     3. 自己开的（Sidebar / CDP 侧 createTarget 或浏览时新开）单独记账，只有带确认标记的才可弃
+     4. 单轮扫描不许把窗口清空（全关光 = 同 profile 的浏览器一起退出）
+     5. tab/release 默认 close:false */
 
 const NEVER_REAP_URL = /^(chrome|chrome-untrusted|devtools|view-source|chrome-extension):\/\//i;
+
+/* /dsh-cdp/exec（HTTP 轮询通道）放行的非 Input 方法。
+   Input.* 单列一条规则整体放行：键鼠输入、insertText、imeSetComposition 都属于透传主路径。 */
+const EXEC_WHITELIST = [
+  'Page.enable',
+  'Page.navigate',
+  'Page.reload',
+  'Page.captureScreenshot',
+  'Page.getLayoutMetrics',
+  'Page.getNavigationHistory',
+  'Page.navigateToHistoryEntry',
+  'Page.startScreencast',
+  'Page.stopScreencast',
+  'Runtime.evaluate',
+  'Target.activateTarget',
+  'Target.getNavigationHistory',
+];
+
 const REAP_DEFAULTS = {
   tickMs: 10000,      /* 每 10 秒扫一遍 */
   orphanMs: 120000,   /* 自动化开的、没人认领：闲置 2 分钟即弃 */
   leaseMs: 900000,    /* 认领了但一直没续租也没 release：15 分钟兜底弃 */
   maxPerTick: 3,      /* 一次最多关 3 个，避免一轮清空 */
+  confirmMs: 20000,   /* 新出现的页面 / 新挂上来的标签必须被观测到至少这么久，才允许被弃 */
 };
 
 /* 有上限的追加：审计桶只留最近 limit 条 */
@@ -401,11 +430,16 @@ class TabKeeper {
     this.base = cdpBase;
     this.cfg = { ...REAP_DEFAULTS, ...(cfg || {}) };
     this.enabled = this.cfg.orphanMs > 0;
-    this.protected = new Set();   /* 装载时就存在的目标：用户自己的，永不关 */
-    this.seen = new Map();        /* targetId -> {url,title,firstSeen,lastChange} */
+    this.protected = new Set();   /* 装载时就存在的目标 + 每次 re-seed 收进来的：用户自己的，永不关 */
+    this.seen = new Map();        /* targetId -> {url,title,firstSeen,lastChange,suspect,confirmed,attached} */
     this.leases = new Map();      /* targetId -> {owner,purpose,claimedAt,lastTouch,leaseUntil,primary} */
+    this.createdByAutomation = new Set(); /* 本进程确认由自动化 / 侧栏开出来的 targetId */
+    this.confirmedByUs = new Set();       /* 其中「确认可弃」的那批：由 claim / tab/created 显式登记 */
     this.reaps = [];              /* 回收审计 */
+    this.skipped = [];            /* 「本来要弃但被保险挡下」审计 */
     this.mirrored = null;         /* 侧栏当前镜像的那个，永不关 */
+    this.autoTargetId = null;     /* 侧栏自己开出来的那一页；没有就退回 mirrored */
+    this.inflightCreates = 0;     /* 正在创建页面的自动化请求数：这期间冒出来的新页优先记成自动化 */
     this.seeded = false;
     this.sweeping = false;
     this.timer = null;
@@ -414,27 +448,99 @@ class TabKeeper {
     const list = await cdpJson(this.base, '/json/list');
     return (Array.isArray(list) ? list : []).filter((item) => item && item.type === 'page');
   }
+  markCreated(targetId, confirmed) {
+    if (!targetId) return targetId;
+    const id = String(targetId);
+    this.createdByAutomation.add(id);
+    if (confirmed) this.confirmedByUs.add(id);
+    /* 显式登记 = 确认是自动化开的，不必再等附着观测；受保护的照样不动 */
+    if (confirmed && !this.protected.has(id)) {
+      const row = this.seen.get(id);
+      if (row) { row.suspect = true; row.confirmed = true; }
+    }
+    return targetId;
+  }
+  beginCreate() { this.inflightCreates += 1; }
+  endCreate() { if (this.inflightCreates > 0) this.inflightCreates -= 1; }
   /* 装载时先照一张相：这一批全是用户自己的标签页 */
   async seed() {
     const pages = await this.pages();
     const stamp = Date.now();
     for (const page of pages) {
       this.protected.add(page.id);
-      this.seen.set(page.id, { targetId: page.id, url: page.url || '', title: page.title || '', firstSeen: stamp, lastChange: stamp });
+      const prev = this.seen.get(page.id);
+      this.seen.set(page.id, {
+        targetId: page.id,
+        url: page.url || '',
+        title: page.title || '',
+        firstSeen: prev ? prev.firstSeen : stamp,
+        lastChange: stamp,
+        suspect: false,
+        confirmed: false,
+        attached: !!page.attached,
+      });
     }
     this.seeded = true;
     return { protected: this.protected.size, pages: pages.length };
+  }
+  /* 重新认领：seed 没成功、或 Chrome 重启导致老 targetId 全部消失时调用。
+     原来写着「宁可误关」的那套逻辑在这里被反过来了：拿不准就当用户自己的。 */
+  async reseed(reason) {
+    const pages = await this.pages();
+    const alive = new Set(pages.map((page) => page.id));
+    const now = Date.now();
+    let adopted = 0;
+    for (const page of pages) {
+      if (this.protected.has(page.id)) continue;
+      this.protected.add(page.id);
+      this.createdByAutomation.delete(page.id);
+      this.confirmedByUs.delete(page.id);
+      const prev = this.seen.get(page.id);
+      this.seen.set(page.id, {
+        targetId: page.id,
+        url: page.url || '',
+        title: page.title || '',
+        firstSeen: prev ? prev.firstSeen : now,
+        lastChange: prev ? prev.lastChange : now,
+        suspect: false,
+        confirmed: false,
+        attached: !!page.attached,
+      });
+      adopted += 1;
+    }
+    /* 已经消失的受保护 id 清掉，免得名单无限长 */
+    for (const targetId of [...this.protected]) {
+      if (!alive.has(targetId) && !this.createdByAutomation.has(targetId)) this.protected.delete(targetId);
+    }
+    this.seeded = true;
+    if (adopted > 0 || reason) {
+      console.log('[dsh-cdp-sidebar] 重新认领标签页：' + reason + '，新增受保护 ' + adopted + ' 个（共 ' + this.protected.size + ' 个）');
+    }
+    return { adopted, protected: this.protected.size };
   }
   track(page) {
     const prev = this.seen.get(page.id);
     const now = Date.now();
     const moved = !!prev && (prev.url !== (page.url || '') || prev.title !== (page.title || ''));
+    const createdHere = this.createdByAutomation.has(page.id);
+    const confirmedHere = this.confirmedByUs.has(page.id);
+    /* suspect：新看到、又没被 protected 收进名单的页面。只有它才会被考虑回收；
+       旧记录缺 suspect/confirmed 字段（升级前留下的脏数据）一律当「不是候选」。 */
+    const suspect = prev ? (prev.suspect === true || confirmedHere) : (!this.protected.has(page.id) || confirmedHere);
+    const attached = !!page.attached;
+    let confirmed = confirmedHere || (!!prev && prev.confirmed === true);
+    /* confirmMs 时间内被 CDP 客户端附着过 = 有自动化在真用它；CDP DevTools 附着本不会产生空窗口，
+       所以这里只给「自己开的」页面开确认，用户窗口里被扩展附着的页面不会被顺手开门 */
+    if (!confirmed && (createdHere || suspect) && attached) confirmed = true;
     this.seen.set(page.id, {
       targetId: page.id,
       url: page.url || '',
       title: page.title || '',
       firstSeen: prev ? prev.firstSeen : now,
       lastChange: moved ? now : (prev ? prev.lastChange : now),
+      suspect,
+      confirmed,
+      attached,
     });
     /* 新出现的、或换了页面的，都算「有人在动它」：租约跟着续一口，不然正在干活的 tab 会被到期误关 */
     if (!prev || moved) {
@@ -450,23 +556,35 @@ class TabKeeper {
     this.seen.delete(targetId);
     this.leases.delete(targetId);
   }
-  async resolveTargetId(body) {
+  resolveTargetId(body) {
     const explicit = String((body && (body.targetId || body.target)) || '');
     if (explicit) return explicit;
     const want = String((body && body.url) || '');
     if (!want) return null;
     for (const row of this.seen.values()) if (row.url === want) return row.targetId;
     for (const row of this.seen.values()) if (row.url && row.url.startsWith(want)) return row.targetId;
-    /* 刚 new_page 出来的 target 可能还没被这一轮 sweep 照到：现查一次 Chrome */
-    try {
-      const pages = await this.pages();
-      for (const page of pages) if ((page.url || '') === want) { this.track(page); return page.id; }
-      for (const page of pages) if ((page.url || '').startsWith(want)) { this.track(page); return page.id; }
-    } catch { /* Chrome 不可达时退回已知的 */ }
+    return null;
+  }
+  /* 现查一次 Chrome（异步；claim 需要 new_page 刚开出来、还没被 sweep 照到的 target） */
+  async resolveTargetIdLive(body, pages) {
+    const explicit = String((body && (body.targetId || body.target)) || '');
+    if (explicit) return explicit;
+    const want = String((body && body.url) || '');
+    if (!want) return null;
+    const found = this.resolveTargetId(body);
+    if (found) return found;
+    let list = pages;
+    if (!list) {
+      try { list = await this.pages(); } catch { list = null; }
+    }
+    if (list) {
+      for (const page of list) if ((page.url || '') === want) { this.track(page); return page.id; }
+      for (const page of list) if ((page.url || '').startsWith(want)) { this.track(page); return page.id; }
+    }
     return null;
   }
   async claim(body) {
-    const targetId = await this.resolveTargetId(body);
+    const targetId = await this.resolveTargetIdLive(body);
     if (!targetId) return null;
     const now = Date.now();
     const owner = String((body && body.owner) || 'main').slice(0, 40);
@@ -482,17 +600,26 @@ class TabKeeper {
       primary: owner === 'main' || (body && body.primary === true),
     };
     this.leases.set(targetId, entry);
-    if (!this.protected.has(targetId)) this.seen.set(targetId, {
-      targetId,
-      url: (this.seen.get(targetId) || {}).url || String((body && body.url) || ''),
-      title: (this.seen.get(targetId) || {}).title || '',
-      firstSeen: (this.seen.get(targetId) || {}).firstSeen || now,
-      lastChange: now,
-    });
+    /* 被显式 claim 的页面直接算「有人开了也有人在用」：允许被自动关（release / 到期兜底），
+       这是唯一一条会让受保护名单以外的页面变成可弃的入口，必须是显式动作 */
+    this.markCreated(targetId, true);
+    if (!this.protected.has(targetId)) {
+      const row = this.seen.get(targetId) || {};
+      this.seen.set(targetId, {
+        targetId,
+        url: row.url || String((body && body.url) || ''),
+        title: row.title || '',
+        firstSeen: row.firstSeen || now,
+        lastChange: now,
+        suspect: true,
+        confirmed: true,
+        attached: row.attached === true,
+      });
+    }
     return entry;
   }
   async touch(body) {
-    const targetId = await this.resolveTargetId(body);
+    const targetId = await this.resolveTargetIdLive(body);
     if (!targetId) return null;
     const lease = this.leases.get(targetId);
     if (!lease) return null;
@@ -525,7 +652,10 @@ class TabKeeper {
     const row = this.seen.get(targetId) || {};
     const text = await cdpJson(this.base, '/json/close/' + encodeURIComponent(targetId));
     this.forget(targetId);
+    this.createdByAutomation.delete(targetId);
+    this.confirmedByUs.delete(targetId);
     if (this.mirrored === targetId) this.mirrored = null;
+    if (this.autoTargetId === targetId) this.autoTargetId = null;
     const entry = push(this.reaps, {
       t: Date.now(),
       targetId,
@@ -537,19 +667,32 @@ class TabKeeper {
     console.log('[dsh-cdp-sidebar] 弃标签页 ' + targetId.slice(0, 8) + ' 原因=' + reason + ' owner=' + (owner || '-') + ' url=' + entry.url);
     return entry;
   }
-  /* 一个 page 目标该不该关，返回 null 表示不动 */
-  candidate(page) {
+  skip(page, reason) {
+    return push(this.skipped, {
+      t: Date.now(),
+      targetId: page.id,
+      reason,
+      url: String((page && page.url) || '').slice(0, 160),
+    }, 30);
+  }
+  /* 一个 page 目标该不该关，返回 null 表示不动。
+     顺序：受保护 → 永不碰的 url → 镜像中 → 不是候选（没确认是自动化开的）→ 观测期不足 → 租约 */
+  candidate(page, now) {
     if (this.protected.has(page.id)) return null;
     if (NEVER_REAP_URL.test(page.url || '')) return null;
     if (this.mirrored && page.id === this.mirrored) return null;
-    const now = Date.now();
+    if (this.autoTargetId && page.id === this.autoTargetId) return null;
+    const row = this.seen.get(page.id);
+    if (!row || row.suspect !== true || row.confirmed !== true) return null;
+    const stamp = now || Date.now();
     const lease = this.leases.get(page.id);
-    const row = this.seen.get(page.id) || { firstSeen: now, lastChange: now };
+    /* 刚出现 / 刚被挂上来的页面先攒够观测时间：拖一下就来不及了，给窗口一次机会 */
+    if (stamp - row.firstSeen < this.cfg.confirmMs) return null;
     if (lease) {
-      if (lease.leaseUntil > now) return null;
-      return { reason: '租约到期未释放', owner: lease.owner, idleMs: now - lease.lastTouch };
+      if (lease.leaseUntil > stamp) return null;
+      return { reason: '租约到期未释放', owner: lease.owner, idleMs: stamp - lease.lastTouch };
     }
-    const idleMs = now - Math.max(row.firstSeen, row.lastChange);
+    const idleMs = stamp - Math.max(row.firstSeen, row.lastChange);
     if (idleMs < this.cfg.orphanMs) return null;
     return { reason: '自动化开的且闲置', owner: null, idleMs };
   }
@@ -558,15 +701,33 @@ class TabKeeper {
     this.sweeping = true;
     try {
       if (mirroredTargetId) this.mirrored = mirroredTargetId;
+      if (!this.seeded) await this.reseed('装载时快照没成功');
       const pages = await this.pages();
+      /* Chrome 重启：之前那张快照里的目标全没了 → 现在窗口里的是用户自己新开的，重新认领 */
+      if (this.seeded && this.protected.size > 0) {
+        const alive = new Set(pages.map((page) => page.id));
+        let anyAlive = false;
+        for (const targetId of this.protected) if (alive.has(targetId)) { anyAlive = true; break; }
+        if (!anyAlive) await this.reseed('Chrome 重启，旧 target 已全部消失');
+      }
       for (const page of pages) this.track(page);
+      const now = Date.now();
       const alive = new Set(pages.map((page) => page.id));
-      for (const targetId of [...this.seen.keys()]) if (!alive.has(targetId) && !this.protected.has(targetId)) this.forget(targetId);
+      for (const targetId of [...this.seen.keys()]) {
+        if (!alive.has(targetId) && !this.protected.has(targetId)) this.forget(targetId);
+      }
+      /* 这是窗口里最后的几个页面：全关光 Chrome 会自己退出（同 profile 的用户窗口一起没），一个都不许动 */
+      if (pages.length <= 1) {
+        if (pages.length === 1) this.skip(pages[0], '窗口里只剩这 1 个页面，关掉会让浏览器退出');
+        return { scanned: pages.length, closed: [], protectedCount: this.protected.size, leases: this.leases.size, skipped: 'last-page' };
+      }
       const closed = [];
       for (const page of pages) {
         if (closed.length >= this.cfg.maxPerTick) break;
-        const verdict = this.candidate(page);
+        const verdict = this.candidate(page, now);
         if (!verdict) continue;
+        /* 保险：关完这一批后至少还要剩一个页面 */
+        if (closed.length >= pages.length - 1) { this.skip(page, '再关就没有页面了，浏览器会退出'); break; }
         try { await this.close(page.id, verdict.reason, verdict.owner); closed.push(page.id); }
         catch (error) { console.warn('[dsh-cdp-sidebar] 弃标签页失败 ' + page.id.slice(0, 8) + ' ' + String((error && error.message) || error)); }
       }
@@ -600,11 +761,13 @@ class TabKeeper {
         primary: lease ? !!lease.primary : false,
         protected: this.protected.has(targetId),
         mirrored: this.mirrored === targetId,
+        suspect: row.suspect === true,
+        confirmed: row.confirmed === true,
+        attached: row.attached === true,
         ageMs: now - row.firstSeen,
         idleMs: now - Math.max(row.firstSeen, row.lastChange),
         leaseUntil: lease ? lease.leaseUntil : null,
-        reapable: !this.protected.has(targetId) && !NEVER_REAP_URL.test(row.url || '') && this.mirrored !== targetId
-          && !(lease && lease.leaseUntil > now),
+        reapable: !!this.candidate({ id: targetId, url: row.url }, now),
       });
     }
     rows.sort((a, b) => (b.primary ? 1 : 0) - (a.primary ? 1 : 0) || b.idleMs - a.idleMs);
@@ -613,12 +776,39 @@ class TabKeeper {
       seeded: this.seeded,
       cfg: this.cfg,
       mirrored: this.mirrored,
+      autoTargetId: this.autoTargetId,
       primary: (this.primaryLease() || {}).targetId || null,
       protectedCount: this.protected.size,
       tabs: rows,
       reaps: this.reaps.slice(-10),
+      skipped: this.skipped.slice(-10),
     };
   }
+}
+
+/* 输入帧的观测记录：只记「发了什么」，不改内容。
+   键鼠事件每秒可能几十条，所以只在计数字段上累加，明细只留最后一帧。 */
+function noteInput(rec, msg) {
+  if (!rec) return;
+  const count = (rec.inputCount = (rec.inputCount || 0) + 1);
+  if (!rec.inputSeen) rec.inputSeen = [];
+  const kind = String(msg.method || '');
+  if (rec.inputSeen.indexOf(kind) < 0 && rec.inputSeen.length < 12) rec.inputSeen.push(kind);
+  const params = msg.params || {};
+  const text = typeof params.text === 'string' ? params.text.slice(0, 80) : null;
+  rec.lastInput = {
+    t: Date.now(),
+    n: count,
+    method: kind,
+    sessionId: msg.sessionId ? String(msg.sessionId).slice(0, 12) : null,
+    type: params.type || null,
+    key: params.key === undefined ? null : String(params.key).slice(0, 24),
+    code: params.code === undefined ? null : String(params.code).slice(0, 24),
+    windowsVirtualKeyCode: params.windowsVirtualKeyCode === undefined ? null : params.windowsVirtualKeyCode,
+    modifiers: params.modifiers === undefined ? null : params.modifiers,
+    text,
+  };
+  return rec.lastInput;
 }
 
 function readJsonBody(req, limit) {
@@ -677,6 +867,10 @@ function bridgeSocket(req, socket, head, base, upstreamOrigin, rec) {
           rec.attached = (rec.attached || []).concat([String((msg.params && msg.params.targetId) || '')]);
           if (rec.attached.length > 12) rec.attached.shift();
         }
+        /* 输入观测：侧栏的键盘 / 鼠标到底有没有发出来、发的什么类型。
+           「侧栏点击能用、打字没反应」这类问题，先看这里有没有 Input.* 记录就能一分为二：
+           没有 → 客户端没发出；有 → 看 count + 最后一帧推给了哪个 session。 */
+        if (method && method.indexOf('Input.') === 0) noteInput(rec, msg);
       } catch { /* 非 JSON 帧（输入事件也是 JSON，这里只是防御畸形帧） */ }
     }
     if (upstream) upstream.send(opcode, payload);
@@ -828,11 +1022,16 @@ export function apply(ctx, config) {
       orphanMs: process.env.DSH_CDP_REAP === '0' ? 0 : (Number(process.env.DSH_CDP_REAP_ORPHAN_MS) || REAP_DEFAULTS.orphanMs),
       leaseMs: Number(process.env.DSH_CDP_REAP_LEASE_MS) || REAP_DEFAULTS.leaseMs,
       maxPerTick: Number(process.env.DSH_CDP_REAP_MAX) || REAP_DEFAULTS.maxPerTick,
+      confirmMs: process.env.DSH_CDP_REAP_CONFIRM_MS === '0' ? 0 : (Number(process.env.DSH_CDP_REAP_CONFIRM_MS) || REAP_DEFAULTS.confirmMs),
     };
     const tabs = new TabKeeper(base, reapCfg);
+    /* 先照快照；照不到就立刻退化成「现有页面全部认领」，绝不留一个空的受保护名单 */
     tabs.seed()
-      .then((info) => console.log('[dsh-cdp-sidebar] 标签页回收就位：受保护 ' + info.protected + ' 个（装载时就有的，永不自动关），回收=' + (tabs.enabled ? '开（闲置 ' + Math.round(tabs.cfg.orphanMs / 1000) + 's）' : '关（DSH_CDP_REAP=0）')))
-      .catch((error) => console.warn('[dsh-cdp-sidebar] 标签页快照失败：' + String((error && error.message) || error)));
+      .then((info) => console.log('[dsh-cdp-sidebar] 标签页回收就位：受保护 ' + info.protected + ' 个（装载时就有的，永不自动关），回收=' + (tabs.enabled ? '开（闲置 ' + Math.round(tabs.cfg.orphanMs / 1000) + 's，观测期 ' + Math.round(tabs.cfg.confirmMs / 1000) + 's）' : '关（DSH_CDP_REAP=0）')))
+      .catch((error) => {
+        console.warn('[dsh-cdp-sidebar] 标签页快照失败，转为延迟重新认领：' + String((error && error.message) || error));
+        tabs.reseed('装载时 Chrome 不可达').catch(() => {});
+      });
     /* 侧栏正在镜像哪个 target：从活的桥会话里读，那个永不自动关 */
     const mirroredTargetId = () => {
       for (let i = diag.sessions.length - 1; i >= 0; i -= 1) {
@@ -856,7 +1055,7 @@ export function apply(ctx, config) {
       };
     };
 
-    const TAB_POSTS = new Set(['exec', 'report', 'tab/claim', 'tab/release', 'tab/touch', 'tab/reap']);
+    const TAB_POSTS = new Set(['exec', 'report', 'tab/claim', 'tab/release', 'tab/touch', 'tab/reap', 'tab/created']);
 
     disposers.push(webServer.register({
       kind: 'prefix',
@@ -868,7 +1067,7 @@ export function apply(ctx, config) {
         if (req.method !== 'GET' && !(TAB_POSTS.has(sub) && req.method === 'POST')) {
           record.result = '405';
           res.writeHead(405, { allow: 'GET, POST', 'content-type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: false, hint: 'GET /dsh-cdp/status | /targets | /tabs | /shot | /diag，POST /dsh-cdp/exec | /report | /tab/claim | /tab/release | /tab/touch | /tab/reap' }));
+          res.end(JSON.stringify({ ok: false, hint: 'GET /dsh-cdp/status | /targets | /tabs | /shot | /diag，POST /dsh-cdp/exec | /report | /tab/claim | /tab/release | /tab/touch | /tab/reap | /tab/created' }));
           return;
         }
         if (sub === 'diag') {
@@ -884,6 +1083,14 @@ export function apply(ctx, config) {
             listenedPort: typeof webServer.listenedPort === 'number' ? webServer.listenedPort : null,
             bridgeCandidates: bridgeCandidates(req),
             uptimeMs: Date.now() - diag.startedAt,
+            /* 输入透传体检：桥上有 Input.* 帧 = 客户端确实发出了；
+               execInputs 是 HTTP 通道走过的输入调用次数。两者都 0，说明键盘事件从来没离开过侧栏。 */
+            input: {
+              bridgeSessionsWithInput: diag.sessions.filter((row) => (row.inputCount || 0) > 0).length,
+              bridgeInputTotal: diag.sessions.reduce((sum, row) => sum + (row.inputCount || 0), 0),
+              execInputs: diag.execInputs || 0,
+              lastExecInput: diag.lastExecInput || null,
+            },
             requests: diag.requests.slice(-25),
             sessions: diag.sessions.slice(-15),
             reports: diag.reports.slice(-15),
@@ -919,12 +1126,24 @@ export function apply(ctx, config) {
           try {
             const body = await readJsonBody(req);
             const method = String(body.method || '');
-            if (!/^Page\.|^Input\.|^Runtime\.evaluate$|^Target\.activateTarget$|^Target\.getNavigationHistory$|^Page\.getNavigationHistory$/.test(method)) {
-              throw new Error('不允许的 CDP 方法：' + method);
+            /* 输入透传是主路径，不再靠正则里的两段 Page./Input. 前缀碰运气：
+               Input.* 整体放行（鼠标 / 键盘 / insertText / 输入法组字），其余只放行下面这份清单。 */
+            const allowed = method.indexOf('Input.') === 0 || EXEC_WHITELIST.indexOf(method) >= 0;
+            if (!allowed) {
+              throw new Error('不允许的 CDP 方法：' + method + '（放行 Input.* 与 ' + EXEC_WHITELIST.join(' / ') + '）');
             }
             const targetId = String(body.target || '') || await pickTargetId(base);
             if (!targetId) throw new Error('9222 上没有 page 目标');
+            /* 侧栏自己导航过去的页面算「自动化在用」：先登记成自开，再按附着后的观测结果决定能否弃 */
+            const before = tabs.seen.get(targetId);
+            if (before && before.suspect === true) tabs.markCreated(targetId);
             const result = await sessions.run(targetId, (rpc, sessionId) => rpc.call(method, body.params || {}, sessionId, 8000));
+            /* HTTP 通道的输入也记账：/diag 才能区分「输入没从侧栏出来」和「出来了但没到页面」 */
+            if (method.indexOf('Input.') === 0) {
+              diag.execInputs = (diag.execInputs || 0) + 1;
+              noteInput(diag, { method, params: body.params || {} });
+              diag.lastExecInput = diag.lastInput;
+            }
             record.result = '200 exec ' + method;
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
             res.end(JSON.stringify({ ok: true, targetId, result }));
@@ -999,8 +1218,9 @@ export function apply(ctx, config) {
               res.end(JSON.stringify({ ok: false, hint: '没有匹配的租约：给 targetId / owner / all:true' }));
               return;
             }
-            /* 默认释放即关页；close:false 只注销租约、标签页留着 */
-            const shouldClose = !(body && body.close === false);
+            /* 默认只注销租约、页面留着（文档里的 close:true 才是显式关页）：
+               默认关页在「用户日常 Chrome 也跑在 9222」时会把用户窗口一起清空 */
+            const shouldClose = !!(body && body.close === true);
             const closed = [];
             const dropped = [];
             const failed = [];
@@ -1035,6 +1255,24 @@ export function apply(ctx, config) {
           }
           return;
         }
+        if (sub === 'tab/created') {
+          /* 侧栏 / 自动化自己开出来的一页：只有这种 targetId 才允许被回收 */
+          try {
+            const body = await readJsonBody(req, 8192);
+            const targetId = String(body.targetId || body.target || '');
+            if (!targetId) throw new Error('缺少 targetId');
+            tabs.markCreated(targetId, true);
+            record.result = '200 tab/created';
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            res.end(JSON.stringify({ ok: true, targetId }));
+          } catch (error) {
+            const message = String((error && error.message) || error);
+            record.result = '400 tab/created ' + message;
+            res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, detail: message }));
+          }
+          return;
+        }
         if (sub !== 'status' && sub !== 'targets') {
           record.result = '404 ' + sub;
           res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
@@ -1044,10 +1282,13 @@ export function apply(ctx, config) {
         try {
           const version = await cdpJson(base, '/json/version');
           const list = await cdpJson(base, '/json/list');
-          const targets = (Array.isArray(list) ? list : [])
-            .filter((item) => item && item.type === 'page')
+          const pages = (Array.isArray(list) ? list : []).filter((item) => item && item.type === 'page');
+          /* /json/list 的 attached 字段决定了新页面能不能进「可回收」名单，这里顺手同步一次观测 */
+          for (const page of pages) tabs.track(page);
+          const targets = pages
             .map((item) => {
               const lease = tabs.leases.get(item.id);
+              const row = tabs.seen.get(item.id) || {};
               return {
                 id: item.id,
                 url: item.url,
@@ -1057,6 +1298,9 @@ export function apply(ctx, config) {
                 primary: lease ? !!lease.primary : false,
                 protected: tabs.protected.has(item.id),
                 mirrored: tabs.mirrored === item.id,
+                suspect: row.suspect === true,
+                confirmed: row.confirmed === true,
+                attached: row.attached === true,
               };
             });
           res.writeHead(200, {

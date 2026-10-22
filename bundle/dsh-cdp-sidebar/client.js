@@ -50,6 +50,74 @@
 
         const BUTTON_FLAGS = { none: 0, left: 1, right: 2, middle: 4 };
 
+        /* ───────── 键盘映射 ─────────
+           dispatchKeyEvent 只给 {key, code, windowsVirtualKeyCode} 在 9222 上对 <input> 是有效的
+           （实测 a/b 都能落字：keydown → beforeinput → input）。所以「侧栏里打字没反应」
+           不是 CDP 做不到，而是侧栏这一侧没把按键送到。现在的分发规则：
+
+             · 可打印字符（canvas 的 keypress 给出，此时 Shift 已折算）→ Input.insertText。
+               这与输入法提交是同一条路径，中文 / emoji / 任意组合键字符都通吃，也不会触发宿主的 IME 分支；
+             · 控制键与非字符键（Enter / Tab / 退格 / 方向键 / F 键）→ dispatchKeyEvent，
+               必须同时带 vk + code，且非文本键用 rawKeyDown 免得页面多收一次 keypress；
+             · Ctrl / Alt / Meta 组合 → 只送真实按键，不自己造字符，让目标页自己处理快捷键；
+             · 输入法组字阶段（isComposing / keyCode 229）不镜像，落定结果由 keypress / compositionend 补。 */
+
+        /* Windows 虚拟键码：命名键 + 标点（标点按 US 布局给，供非 US 键盘的 event.code 用） */
+        const NAMED_VK = {
+          Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17, Alt: 18, CapsLock: 20, Escape: 27,
+          ' ': 32, Spacebar: 32, PageUp: 33, PageDown: 34, End: 35, Home: 36,
+          ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+          Insert: 45, Delete: 46, Meta: 91, ContextMenu: 93,
+          F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117, F7: 118, F8: 119,
+          F9: 120, F10: 121, F11: 122, F12: 123,
+        };
+        const PUNCT_VK = {
+          ';': 186, ':': 186, '=': 187, '+': 187, ',': 188, '<': 188, '-': 189, '_': 189,
+          '.': 190, '>': 190, '/': 191, '?': 191, '`': 192, '~': 192,
+          '[': 219, '{': 219, '\\': 220, '|': 220, ']': 221, '}': 221, "'": 222, '"': 222,
+        };
+        /* KeyboardEvent.code 需要物理键位：Shift 后的符号映射回未 Shift 的那个键 */
+        const CODE_FOR_CHAR = {
+          '!': 'Digit1', '@': 'Digit2', '#': 'Digit3', '$': 'Digit4', '%': 'Digit5', '^': 'Digit6',
+          '&': 'Digit7', '*': 'Digit8', '(': 'Digit9', ')': 'Digit0',
+          '_': 'Minus', '+': 'Equal', '{': 'BracketLeft', '}': 'BracketRight',
+          '|': 'Backslash', ':': 'Semicolon', '"': 'Quote', '<': 'Comma', '>': 'Period',
+          '?': 'Slash', '~': 'Backquote', ' ': 'Space',
+        };
+        const KEY_ALIASES = { Spacebar: ' ', Space: ' ', Esc: 'Escape', Del: 'Delete', Left: 'ArrowLeft', Right: 'ArrowRight', Up: 'ArrowUp', Down: 'ArrowDown', Return: 'Enter' };
+
+        /* 从按键信息推出 vk / code。code 优先用浏览器给的（真键盘一定有），没有才自己算 */
+        function keyGeometry(key, code) {
+          let k = key || '';
+          if (KEY_ALIASES[k]) k = KEY_ALIASES[k];
+          let vk = 0;
+          let outCode = code || '';
+          if (/^[a-zA-Z]$/.test(k)) {
+            vk = k.toUpperCase().charCodeAt(0);
+            if (!outCode) outCode = 'Key' + k.toUpperCase();
+          } else if (/^[0-9]$/.test(k)) {
+            vk = k.charCodeAt(0);
+            if (!outCode) outCode = 'Digit' + k;
+          } else if (PUNCT_VK[k]) {
+            vk = PUNCT_VK[k];
+            if (!outCode) outCode = CODE_FOR_CHAR[k] || '';
+          } else if (NAMED_VK[k]) {
+            vk = NAMED_VK[k];
+          } else if (k.length === 1 && k.charCodeAt(0) > 0x40) {
+            /* 非 ASCII 字符（中文、emoji）：没有对应物理键，交给 insertText，这里给个占位 */
+            vk = 0;
+          }
+          return { key: k, code: outCode, vk };
+        }
+
+        /* Enter / Tab / 退格等「不产生文本但有默认行为」的键 */
+        const NON_TEXT_KEYS = new Set(['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Insert', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12']);
+
+        function modifierMask(event) {
+          /* CDP: Alt=1, Ctrl=2, Meta=4, Shift=8 */
+          return (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0);
+        }
+
         class CdpMirror {
           constructor({ onFrame, onState }) {
             this.onFrame = onFrame;
@@ -758,6 +826,13 @@
           }
           async createTarget(url) {
             const { targetId } = await this.command('Target.createTarget', { url });
+            /* 告诉宿主：这一页是侧栏自己开的，只有它能被回收（普通导航出来的页面不在此列） */
+            fetch('/dsh-cdp/tab/created', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ targetId, owner: 'sidebar' }),
+            }).catch(() => { /* 宿主不在线就算了：拿不准就不关，宁可漏关 */ });
             await this.attach(targetId);
             await this.refreshTargets().catch(() => {});
             return targetId;
@@ -783,9 +858,43 @@
             if (!this.sessionId && !this.pollTarget) return;
             this.command('Input.dispatchKeyEvent', { type, ...init }).catch(() => {});
           }
+          /* 可打印文本一律走这里：insertText 与 IME 提交是同一条路径，
+             中文 / emoji / 输入法组字结果不需要任何额外处理 */
           insertText(text) {
             if (!this.sessionId && !this.pollTarget) return Promise.resolve();
+            if (!text) return Promise.resolve();
             return this.command('Input.insertText', { text }).catch(() => {});
+          }
+          /* 一次按键的完整语义。字符串 → insertText（与 IME 提交同路径）；
+             控制键 → dispatchKeyEvent（keyDown/keyUp 都带 vk，否则页面收不到 keydown）。
+             repeat 只重发 keyDown：现实中按住不放不会重发 keyUp。 */
+          typeText(text) {
+            if (text) this.insertText(text);
+          }
+          pressKey(key, code, mods, repeat) {
+            const def = keyGeometry(key, code);
+            /* 没有物理键的字符（中文、emoji）只能靠 insertText，硬塞 keyDown 页面也落不了字 */
+            if (!def.vk) {
+              if (!repeat && key) this.insertText(key);
+              return;
+            }
+            const modifiers = mods || 0;
+            const base = {
+              key: def.key,
+              code: def.code,
+              windowsVirtualKeyCode: def.vk,
+              nativeVirtualKeyCode: def.vk,
+              modifiers,
+            };
+            /* text 只给能产生文本的控制键（Enter / Tab / 空格）；别的键带 text 会让 Chrome 多派发一次 char */
+            const carryText = def.key === 'Enter' ? '\r' : def.key === 'Tab' ? '\t' : def.key === ' ' ? ' ' : undefined;
+            /* rawKeyDown 不派发 keypress：非文本键用它，页面只收到 keydown */
+            const type = carryText !== undefined ? 'keyDown' : NON_TEXT_KEYS.has(def.key) ? 'rawKeyDown' : 'keyDown';
+            const down = { type, ...base };
+            if (carryText !== undefined) down.text = carryText;
+            this.key(type, down);
+            if (repeat) return;
+            this.key('keyUp', { ...base });
           }
           close() {
             this.closed = true;
@@ -1008,6 +1117,10 @@
               },
               onMouseDown(event) {
                 event.preventDefault();
+                /* 先把焦点拿到 canvas 上：鼠标事件不依赖焦点，键盘事件依赖，
+                   「点得动但打不了字」最常见的一条就是这里没聚焦 */
+                const node = canvasRef.current;
+                if (node && typeof node.focus === 'function') node.focus();
                 const mirror = mirrorRef.current;
                 const p = toPage(event);
                 if (!mirror || !p) return;
@@ -1036,21 +1149,31 @@
               onContextMenu(event) {
                 event.preventDefault();
               },
+              /* ── 键盘 ──
+                 可打印字符走 keypress（真实键盘一定有这一环，此时 char 已过 Shift 处理）；
+                 keydown 只负责控制键、非字符键和组合键。两条路都不重复送同一个字符。 */
               onKeyDown(event) {
                 const mirror = mirrorRef.current;
                 if (!mirror) return;
-                if (event.key === 'Tab') event.preventDefault();
-                const init = {
-                  key: event.key,
-                  code: event.code,
-                  windowsVirtualKeyCode: event.keyCode,
-                  nativeVirtualKeyCode: event.keyCode,
-                  modifiers: (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0),
-                };
-                if (event.key.length === 1) init.text = event.key;
-                mirror.key('keyDown', init);
-                if (event.repeat) return;
-                mirror.key('keyUp', { ...init, text: undefined });
+                const nav = event.key === 'Tab' || event.key === 'Backspace' || event.code === 'Space' || /^Arrow/.test(event.key || '') || event.key === ' ';
+                if (nav) event.preventDefault();
+                /* 输入法组字阶段不镜像：真实按键到不了页面，落定结果由 keypress / compositionend 补 */
+                if (event.isComposing || event.key === 'Dead' || event.key === 'Process' || event.keyCode === 229) return;
+                const combo = event.ctrlKey || event.metaKey || event.altKey;
+                const printable = typeof event.key === 'string' && event.key.length === 1 && !NON_TEXT_KEYS.has(event.key);
+                if (!combo && printable) return;   /* 字符交给 onKeyPress，避免一次按键送两遍 */
+                mirror.pressKey(event.key, event.code, modifierMask(event), event.repeat);
+              },
+              onKeyPress(event) {
+                const mirror = mirrorRef.current;
+                if (!mirror) return;
+                event.preventDefault();
+                if (event.ctrlKey || event.metaKey || event.altKey) return;  /* 组合键不产生文本 */
+                if (event.isComposing) return;
+                const ch = event.key || '';
+                if (!ch || ch.length !== 1) return;
+                if (ch === '\r' || ch === '\n' || ch === '\t') return;  /* Enter/Tab 已由 keydown 送过 */
+                mirror.typeText(ch);
               },
               onPaste(event) {
                 const mirror = mirrorRef.current;
@@ -1059,6 +1182,14 @@
                   event.preventDefault();
                   mirror.insertText(value);
                 }
+              },
+              /* 输入法在 canvas 上组字：宿主输入法的组合过程不可镜像，
+                 只把最终落定的结果 insertText 进去 */
+              onCompositionEnd(event) {
+                const mirror = mirrorRef.current;
+                if (!mirror) return;
+                const value = event.data;
+                if (value) mirror.insertText(value);
               },
             };
           }, [toPage, ripple]);
@@ -1170,7 +1301,10 @@
                 onWheel: handlers.onWheel,
                 onContextMenu: handlers.onContextMenu,
                 onKeyDown: handlers.onKeyDown,
-                onKeyUp: (e) => e.preventDefault(),
+                onKeyPress: handlers.onKeyPress,
+                /* KeyUp 不能 preventDefault 一刀切：Tab / 方向键的默认行为在 keydown 里已经拦过，
+                   keyup 再拦会让部分宿主把「按住不放」判成取消 */
+                onCompositionEnd: handlers.onCompositionEnd,
                 onPaste: handlers.onPaste,
               }),
               h('span', { ref: rippleRef, style: S.ripple }),

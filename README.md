@@ -218,6 +218,52 @@ HARNESS_BLOCK_UPGRADE=1 启动 harness              # 桥全失败 → 自动切
 | `⚙` | 诊断行开关（非 live 时自动展开）：状态、通道（bridge / direct / poll）、页面 origin、桥地址、帧计数、失败原因原文 |
 | canvas | 目标页面的 screencast 画面；上面可直接点 / 滚 / 打字（含中文，走 `Input.insertText`） |
 
+### 输入透传：点 + 键盘（2026-10-20 修）
+
+以前只有鼠标能用、键盘完全没反应。改完后两条通道（桥 / HTTP 轮询）都走同一套分发规则。
+
+| 输入 | 走的 CDP 命令 | 为什么 |
+| --- | --- | --- |
+| 可打印字符（含 Shift 后的符号） | `Input.insertText` | 与输入法提交同一条路径，中文 / emoji / 任意字符通吃，不会触发宿主的 IME 分支 |
+| Enter / Tab / Backspace / 方向键 / F 键 | `Input.dispatchKeyEvent`，非文本键用 `rawKeyDown` | 这些键要的是**默认行为**（换行、换焦、删字、移光标），必须带 `windowsVirtualKeyCode` + `code` |
+| Ctrl / Alt / Meta 组合 | 只送真实按键，不造字符 | 让目标页自己处理快捷键；不额外插入文本 |
+| 输入法组字阶段（`isComposing` / keyCode 229） | 不镜像 | 组合过程在宿主窗口的输入法里，镜像不了；落定结果由 `keypress` / `compositionend` 补 |
+| 粘贴 | `Input.insertText` | 直接送整段文本，不逐字符重放 |
+
+配套三处修正：
+
+1. **点 canvas 先 `focus()`**：鼠标事件不需要焦点，键盘事件需要。「点得动、打不了字」这条路径就是这里漏了聚焦。
+2. **`/exec` 白名单**：原来靠一条正则，`Input.*` 是碰巧被前缀命中的，错误提示里也看不出放行范围。
+   现在 `Input.*` 整体放行（鼠标 / 键盘 / `insertText` / `imeSetComposition`），其余走 `EXEC_WHITELIST` 清单。
+3. **`/diag` 新增 `input` 段**：桥上一个 `Input.*` 帧都没收到，说明事件根本没离开侧栏；
+   收到了但页面没反应，才是分发或目标页的问题。这一项把「侧栏没发」和「发了没到」分开：
+
+```json
+"input": { "bridgeSessionsWithInput": 1, "bridgeInputTotal": 27, "execInputs": 0, "lastExecInput": null }
+```
+
+桥会话明细里还能看到 `inputSeen`（收到过哪几种 `Input.*`）与 `lastInput`（最后一帧的 key / vk / modifiers / text）。
+
+实测（探针页 + 真 9222 Chrome，从 `client.js` 原样切出键盘分发喂真实事件对象，16/16）：
+
+| 用例 | 结果 |
+| --- | --- |
+| 英文 `hello` | `value="hello"`，5 次 `input` 事件 |
+| 中文 `中文测试` | `value="中文测试"` |
+| Shift 字符 `!@A` | `value="!@A"` |
+| 数字与连字符 `2024-10` | `value="2024-10"` |
+| Backspace | `"abc"` → `"ab"`，页面收到 `keydown` |
+| Enter | 页面收到 `keydown` → `keypress` → `beforeinput` → `input` |
+| 方向键 | 左移两格后 `aZbc` |
+| Ctrl+A | 不插入字符，页面收到 `ctrl` 组合的 `keydown` |
+| 组字阶段 `isComposing` | 不落字（等 `compositionend`） |
+| Tab | 目标页真换焦（`activeElement` 变到下一个输入框） |
+| 命令形状 | 字符只发 `Input.insertText`；Enter 发 `keyDown/vk13` + `keyUp/vk13`；没有「keyDown 带可打印 text」 |
+
+HTTP 通道（真 `index.js` 路由 + 真 9222，8/8）：
+`Input.insertText` / `Input.dispatchKeyEvent` 走 `/exec` 均 200 且页面落字；`Target.createTarget` 仍被拒；
+`/diag.input` 有记账；`/status` 未受影响。
+
 ### 标签页下拉切换
 
 顶栏那行 URL 是一个下拉控件，展开后列出 Chrome 里所有 `page` 目标，每项显示标题 + URL，
@@ -272,13 +318,22 @@ HARNESS_BLOCK_UPGRADE=1 启动 harness              # 桥全失败 → 自动切
 
 | 类别 | 怎么判定 | 会不会被自动关 |
 | --- | --- | --- |
-| **受保护（protected）** | 宿主装载那一刻 `GET /json/list` 里已存在的 page 目标 = 用户自己窗口里的标签页 | 永不 |
-| **自动化开的（orphan）** | 装载之后新出现的 page 目标 | 闲置超过 `orphanMs`（默认 120 s）即弃 |
+| **受保护（protected）** | 装载时 `GET /json/list` 里已存在的 page 目标；装载时快照失败或 Chrome 重启时把当前页面**重新认领**进来 | 永不 |
+| **自动化开的（orphan）** | 只有被显式登记过的才可弃：`POST /dsh-cdp/tab/created`、`POST /tab/claim`，或 `/json/list` 里带 `attached:true` 的新页面；其余拿不准的一律按用户自己的处理 | 闲置超过 `orphanMs`（默认 120 s）且已过观测期才弃 |
 | **有人在用（lease）** | `POST /dsh-cdp/tab/claim` 登记 `owner`；每次导航 / `touch` 自动续租 | 租约内不关；超过 `leaseMs`（默认 15 min）没续也没 release → 兜底弃，原因 `租约到期未释放` |
 | **永不碰的 url** | `chrome://` / `chrome-untrusted://` / `devtools://` / `view-source:` / `chrome-extension://` | 永不 |
 | **侧栏正在镜像的那一页** | 当前 diag 里最新一条 `attached` 的 targetId | 永不（避免把自己正在看的那页关掉） |
 
-一轮扫描最多关 `maxPerTick`（默认 3）个，不会一次清空。
+三条硬保险（任何一条成立就本轮不关）：
+
+1. 新页面得先被观测到 `confirmMs`（默认 20 s）才具备被弃资格；
+2. 一轮最多关 `maxPerTick`（默认 3）个，且关完至少还要剩 1 个页面；
+3. 窗口里只剩 1 个页面时一个都不许关——关空最后一个页面，同 profile 的 Chrome 会整个退出。
+
+> 背景（2026-10-20 事故）：桌面快捷方式把用户日常 Chrome 也起在 `9222` + `~/.dsh/chrome-cdp-profile` 上。
+> 当时 `seed()` 只在装载那一刻拍快照，一次都没成功 → `protectedCount:0`、`seeded:false`，
+> 之后用户手动打开的每个页面都被当成 orphan 关掉，窗口清空后浏览器自杀。
+> 现在拿不准的页面一律按「用户自己的」处理：宁可漏关，不可错杀。
 
 ### 一个 tab 的完整生命周期
 
@@ -301,7 +356,8 @@ HARNESS_BLOCK_UPGRADE=1 启动 harness              # 桥全失败 → 自动切
 | `/tabs` | GET | 快照：`enabled / cfg / protectedCount / mirrored / primary / tabs[] / reaps[]` |
 | `/tab/claim` | POST | `{targetId \| url, owner, purpose, ttlMs}` → 登记租约；`owner:"main"` 即宣布「侧栏粘住这页」；url 可反查 targetId（刚开出来、还没被 sweep 照到也算） |
 | `/tab/touch` | POST | `{targetId \| url, ttlMs}` 续租 |
-| `/tab/release` | POST | `{owner \| targetId \| all:true}` 释放；默认顺手关页，`close:false` 只注销租约、页面留着 |
+| `/tab/release` | POST | `{owner \| targetId \| all:true}` 释放；**默认只注销租约、页面留着**，要关页必须显式 `close:true` |
+| `/tab/created` | POST | `{targetId}` 登记「这一页是侧栏 / 自动化自己开的」——只有登记过的 targetId 才允许被回收；`client.js` 的 `createTarget()` 会自动调用 |
 | `/tab/reap` | POST | 立刻跑一轮扫描（不等 tick） |
 | `/status` `/targets` | GET | 顺带带 `tabState`；每个 target 行带 `owner / primary / protected / mirrored` |
 
@@ -316,6 +372,7 @@ HARNESS_BLOCK_UPGRADE=1 启动 harness              # 桥全失败 → 自动切
 | `DSH_CDP_REAP_ORPHAN_MS` | 120000 | 自动化开的、没人认领，闲置多久即弃 |
 | `DSH_CDP_REAP_LEASE_MS` | 900000 | 租约有效期 / 兜底弃时限 |
 | `DSH_CDP_REAP_MAX` | 3 | 一轮最多关几个 |
+| `DSH_CDP_REAP_CONFIRM_MS` | 20000 | 新页面观测期：在这之前一律不弃（设 `0` 关掉这个缓冲） |
 
 ### 侧栏粘住主代理那一页（`client.js`）
 
@@ -398,6 +455,11 @@ harness 用真实 `client.js` + 真实 `index.js` 路由，配一个最小 React
 - 这是画面镜像，不是 DOM：侧栏里选不中文字、看不到页面文本层，
   需要文本时在 MCP 那边读 DOM；侧栏 canvas 上仍可直接打字（含中文走 `Input.insertText`）。
 - 输入坐标相对**可视视口**，所以映射只做缩放、不加 scrollOffset。
+- **输入法组字过程不镜像**：在侧栏里用中文输入法打字，组字候选框属于宿主窗口，
+  页面在落定（`compositionend` / `keypress`）之前收不到任何东西。落定后整段 `insertText` 进去，
+  所以页面的 `compositionstart` / `compositionupdate` 拿不到。要在页面上看到真实组字序列，
+  只能在 Chrome 窗口里直接打。
+- **可见性**：canvas 不聚焦就收不到键盘事件，所以 `onMouseDown` 第一步就 `focus()`；
 - Chrome 的 `/json/*` 不提供 CORS 头，浏览器不能直接跨源 fetch 9222；
   状态探测因此必须走宿主路由 `/dsh-cdp/status`。
 - **宿主半侧改动要重启才生效**：`index.js` 只在组合（compose）时装载，`TabKeeper` 与 `/dsh-cdp/tabs` 那套路由
